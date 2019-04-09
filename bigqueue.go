@@ -3,6 +3,7 @@ package bigqueue
 import (
 	"errors"
 	"sync"
+	"time"
 )
 
 var (
@@ -26,19 +27,19 @@ type Queue interface {
 
 // MmapQueue implements Queue interface
 type MmapQueue struct {
-	// The order of locks: hLock > tLock > am.Lock
-
 	conf  *bqConfig
 	index *queueIndex
 	am    *arenaManager
 
 	// using atomic to update these below
 	mutOps    *atomicInt64
-	lastFlush *atomicInt64
+	flushChan chan struct{}
+	done      chan struct{}
+	quit      chan struct{}
 
+	// The order of locks: hLock > tLock > am.Lock
 	// protects head
 	hLock sync.RWMutex
-
 	// protects tail
 	tLock sync.RWMutex
 }
@@ -86,14 +87,23 @@ func NewMmapQueue(dir string, opts ...Option) (Queue, error) {
 		return nil, ErrInvalidArenaSize
 	}
 
-	complete = true
-	return &MmapQueue{
+	bq := &MmapQueue{
 		conf:      conf,
 		am:        am,
 		index:     index,
 		mutOps:    newAtomicInt64(0),
-		lastFlush: newAtomicInt64(conf.clock.Now().UnixNano()),
-	}, nil
+		flushChan: make(chan struct{}, 100),
+		done:      make(chan struct{}),
+		quit:      make(chan struct{}),
+	}
+
+	// setup background thread to flush arenas periodically
+	if err := bq.setupBgFlush(); err != nil {
+		return nil, err
+	}
+
+	complete = true
+	return bq, nil
 }
 
 // IsEmpty returns true when queue is empty
@@ -127,6 +137,10 @@ func (q *MmapQueue) Close() error {
 	q.tLock.Lock()
 	defer q.tLock.Unlock()
 
+	// wait for quitting the background routine
+	q.quit <- struct{}{}
+	<-q.done
+
 	var retErr error
 	if err := q.am.close(); err != nil {
 		retErr = err
@@ -157,20 +171,41 @@ func (q *MmapQueue) flush() error {
 	}
 
 	q.mutOps.store(0)
-	q.lastFlush.store(q.conf.clock.Now().UnixNano())
 	return nil
 }
 
-// flushPeriodic performs a periodic flush if need be
-func (q *MmapQueue) flushPeriodic() error {
-	mutOps := q.mutOps.load()
-	lastFlush := q.lastFlush.load()
-
-	enoughMutations := mutOps >= q.conf.flushMutOps
-	enoughTime := (q.conf.clock.Now().UnixNano() - lastFlush) >= q.conf.flushPeriod
-	if enoughMutations || enoughTime {
-		return q.flush()
+// setupBgFlush sets up background go routine to periodically flush arenas
+func (q *MmapQueue) setupBgFlush() error {
+	t := &time.Timer{
+		C: make(chan time.Time),
 	}
+	if q.conf.flushPeriod != 0 {
+		t = time.NewTimer(time.Duration(q.conf.flushPeriod))
+	}
+
+	go func() {
+		for {
+			if q.conf.flushPeriod != 0 {
+				if !t.Stop() {
+					<-t.C
+				}
+
+				t.Reset(time.Duration(q.conf.flushPeriod))
+			}
+
+			select {
+			case <-q.quit:
+				defer func() { q.done <- struct{}{} }()
+				return
+			case <-q.flushChan:
+				if q.mutOps.load() >= q.conf.flushMutOps {
+					q.Flush()
+				}
+			case <-t.C:
+				q.Flush()
+			}
+		}
+	}()
 
 	return nil
 }
