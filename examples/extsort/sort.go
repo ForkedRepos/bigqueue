@@ -19,6 +19,10 @@ var (
 	bqFileIndexCount = 0
 )
 
+type pair struct {
+	value, index int
+}
+
 // ExternalSort perform external sort https://en.wikipedia.org/wiki/External_sorting
 // The inputPath should be a path to a file containing integers in each line
 // The outputPath is similarly formatted file with sorted integers
@@ -40,7 +44,12 @@ func ExternalSort(inputPath, tempPath, outputPath string, maxMemSortSize int) er
 	}
 
 	log.Println("starting merge step")
-	oq, err := merge(tempPath, iqs)
+	optimalK := maxMemSortSize * 8 / 128 / 1024 / 1024
+	if optimalK < 2 {
+		optimalK = 2
+	}
+
+	oq, err := merge(tempPath, optimalK, iqs)
 	if err != nil {
 		return fmt.Errorf("error in merge step :: %v", err)
 	}
@@ -55,9 +64,9 @@ func ExternalSort(inputPath, tempPath, outputPath string, maxMemSortSize int) er
 
 // divide step divides all the input data into sorted group of elements.
 // Each group is persisted to disk using bigqueue interface.
-func divide(inputPath, tempPath string, maxMemSortSize int) ([]bigqueue.IBigQueue, error) {
+func divide(inputPath, tempPath string, maxMemSortSize int) ([]bigqueue.Queue, error) {
 	log.Println("reading input file")
-	queues := make([]bigqueue.IBigQueue, 0)
+	queues := make([]bigqueue.Queue, 0)
 
 	// open input file
 	fd, err := os.Open(inputPath)
@@ -122,42 +131,109 @@ func divide(inputPath, tempPath string, maxMemSortSize int) ([]bigqueue.IBigQueu
 }
 
 // merge step merges the sorted group of elements stored in bigqueue using bigqueue
-// TODO: merge multiple queues together instead of just 2 queues
-func merge(tempPath string, queues []bigqueue.IBigQueue) (bigqueue.IBigQueue, error) {
+func merge(tempPath string, k int, queues []bigqueue.Queue) (bigqueue.Queue, error) {
 	currentQueues := queues
-	nextQueues := make([]bigqueue.IBigQueue, 0)
+	nextQueues := make([]bigqueue.Queue, 0)
 	for iteration := 0; len(currentQueues) != 1; iteration++ {
 		log.Printf("iteration %d, # queues %d\n", iteration, len(currentQueues))
 
-		for i := 0; i < len(currentQueues); i += 2 {
-			// if only one queue is left, just add this queue
-			q1 := currentQueues[i]
-			if i+1 >= len(currentQueues) {
-				nextQueues = append(nextQueues, q1)
-				continue
+		for i := 0; i < len(currentQueues); i += k {
+			lastElem := i + k
+			if lastElem > len(currentQueues) {
+				lastElem = len(currentQueues)
 			}
 
-			// otherwise, merge the two queues
-			q2 := currentQueues[i+1]
-			mq, err := mergeQueues(q1, q2, tempPath)
+			queueList := currentQueues[i:lastElem]
+			mq, err := mergeQueues(queueList, tempPath)
 			if err != nil {
 				return nil, fmt.Errorf("error in merging two queues :: %v", err)
 			}
-			q1.Close()
-			q2.Close()
+
+			for j := i; j < lastElem; j++ {
+				currentQueues[j].Close()
+			}
 
 			nextQueues = append(nextQueues, mq)
 		}
 
 		currentQueues = nextQueues
-		nextQueues = make([]bigqueue.IBigQueue, 0)
+		nextQueues = make([]bigqueue.Queue, 0)
 	}
 
 	return currentQueues[0], nil
 }
 
-func buildBigQueue(tempPath string, data []int) (bigqueue.IBigQueue, error) {
-	bq, err := bigqueue.NewBigQueue(getTempDir(tempPath), bigqueue.SetMaxInMemArenas(3))
+func mergeQueues(queueList []bigqueue.Queue, tempPath string) (bigqueue.Queue, error) {
+	const maxValue = int(^uint(0) >> 1)
+
+	mq, err := bigqueue.NewMmapQueue(getTempDir(tempPath), bigqueue.SetMaxInMemArenas(3))
+	if err != nil {
+		return nil, fmt.Errorf("unable to create bigqueue :: %v", err)
+	}
+
+	k := len(queueList)
+	segTree := make([]pair, 2*k)
+
+	for i := 0; i < k; i++ {
+		if queueList[i].IsEmpty() {
+			segTree[i+k] = pair{maxValue, i}
+			continue
+		}
+
+		val, err := queueList[i].Peek()
+		if err != nil {
+			return nil, fmt.Errorf("unable to peek :: %v", err)
+		}
+		num, err := strconv.Atoi(string(val))
+		if err != nil {
+			return nil, fmt.Errorf("error in conversion :: %v ", err)
+		}
+
+		segTree[i+k] = pair{num, i}
+	}
+
+	for i := k - 1; i > 0; i-- {
+		segTree[i] = min(segTree[2*i], segTree[2*i+1])
+	}
+
+	empty := 0
+	for empty < k {
+		top := segTree[1]
+
+		if err := queueList[top.index].Dequeue(); err != nil {
+			return nil, fmt.Errorf("unable to dequeue :: %v", err)
+		}
+
+		mq.Enqueue([]byte(strconv.Itoa(top.value)))
+
+		index := top.index + k
+		if queueList[top.index].IsEmpty() {
+			empty++
+			segTree[index] = pair{maxValue, top.index}
+		} else {
+			val, err := queueList[top.index].Peek()
+			if err != nil {
+				return nil, fmt.Errorf("unable to peek :: %v", err)
+			}
+
+			num, err := strconv.Atoi(string(val))
+			if err != nil {
+				return nil, fmt.Errorf("error in conversion :: %v ", err)
+			}
+			segTree[index] = pair{num, top.index}
+		}
+
+		for index != 1 {
+			index = index / 2
+			segTree[index] = min(segTree[index*2], segTree[index*2+1])
+		}
+	}
+
+	return mq, nil
+}
+
+func buildBigQueue(tempPath string, data []int) (bigqueue.Queue, error) {
+	bq, err := bigqueue.NewMmapQueue(getTempDir(tempPath), bigqueue.SetMaxInMemArenas(3))
 	if err != nil {
 		return nil, fmt.Errorf("unable to init bigqueue :: %v", err)
 	}
@@ -184,63 +260,14 @@ func getTempDir(tempPath string) string {
 	return queuePath
 }
 
-func mergeQueues(q1, q2 bigqueue.IBigQueue, tempPath string) (bigqueue.IBigQueue, error) {
-	mq, err := bigqueue.NewBigQueue(getTempDir(tempPath), bigqueue.SetMaxInMemArenas(3))
-	if err != nil {
-		return nil, fmt.Errorf("unable to create bigqueue :: %v", err)
+func min(i, j pair) pair {
+	if i.value < j.value {
+		return i
 	}
-
-	for !q1.IsEmpty() && !q2.IsEmpty() {
-		e1, err1 := q1.Peek()
-		e2, err2 := q2.Peek()
-		if err1 != nil || err2 != nil {
-			return nil, fmt.Errorf("unable to peek :: %v || %v", err1, err2)
-		}
-
-		num1, err1 := strconv.Atoi(string(e1))
-		num2, err2 := strconv.Atoi(string(e2))
-		if err1 != nil || err2 != nil {
-			return nil, fmt.Errorf("error in conversion :: %v || %v", err1, err2)
-		}
-
-		if num1 < num2 {
-			if err := q1.Dequeue(); err != nil {
-				return nil, fmt.Errorf("unable to dequeue :: %v", err1)
-			}
-
-			mq.Enqueue([]byte(strconv.Itoa(num1)))
-		} else {
-			if err := q2.Dequeue(); err != nil {
-				return nil, fmt.Errorf("unable to dequeue :: %v", err1)
-			}
-
-			mq.Enqueue([]byte(strconv.Itoa(num2)))
-		}
-	}
-
-	// add elements from the non-empty queue
-	var lq bigqueue.IBigQueue
-	if q1.IsEmpty() {
-		lq = q1
-	} else {
-		lq = q2
-	}
-	for !lq.IsEmpty() {
-		e1, err := lq.Peek()
-		if err != nil {
-			return nil, fmt.Errorf("unable to peek :: %v", err)
-		}
-		mq.Enqueue(e1)
-
-		if err := lq.Dequeue(); err != nil {
-			return nil, fmt.Errorf("unable to dequeue :: %v", err)
-		}
-	}
-
-	return mq, nil
+	return j
 }
 
-func writeToFile(oq bigqueue.IBigQueue, outputPath string) error {
+func writeToFile(oq bigqueue.Queue, outputPath string) error {
 	// write the final output to file
 	od, err := os.Create(outputPath)
 	if err != nil {
